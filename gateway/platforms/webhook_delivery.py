@@ -19,6 +19,21 @@ def route_digest(adapter, chat_id):
     return hashlib.sha256(json.dumps(route, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def _rose_callback_url_ok(url):
+    """An https callback URL, or http to a loopback host (local tests); an unrendered template fails."""
+    from urllib.parse import urlsplit
+    from gateway.platforms.webhook import _LOOPBACK_HOSTS
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme == 'https':
+        return bool(parts.hostname)
+    return parts.scheme == 'http' and parts.hostname in _LOOPBACK_HOSTS
+
+
 def validate_destination(delivery):
     from gateway.platforms.webhook import _is_known_platform, _REPO_RE
     if (not isinstance(delivery, dict)
@@ -35,11 +50,17 @@ def validate_destination(delivery):
         repo, number = extra.get('repo'), extra.get('pr_number')
         if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo) or not str(number).isdigit() or int(number) <= 0:
             raise RuntimeStoreError('invalid_params')
+    elif target == 'rose_callback':
+        # Rose Command Centre: the signing secret is the route's, read at send time, never stored here.
+        if not _rose_callback_url_ok(extra.get('callback_url')) or not isinstance(
+                extra.get('rose_request_id'), str) or not extra['rose_request_id']:
+            raise RuntimeStoreError('invalid_params')
     elif target != 'log' and not _is_known_platform(target):
         raise RuntimeStoreError('invalid_params')
     # Configuration extras may contain credentials or whole rendered payloads.
     # Persist only fields the selected sender actually consumes.
-    fields = {'log': (), 'github_comment': ('repo', 'pr_number')}.get(
+    fields = {'log': (), 'github_comment': ('repo', 'pr_number'),
+              'rose_callback': ('callback_url', 'rose_request_id')}.get(
         target, ('chat_id', 'message_thread_id', 'thread_id'))
     result = {'deliver': target, 'deliver_extra': deepcopy({key: extra[key] for key in fields if key in extra})}
     # Omit the unbound defaults to preserve pre-profile receipt fingerprints.
@@ -58,7 +79,8 @@ def snapshot_destination(adapter, delivery):
     from gateway.config import Platform
 
     result = validate_destination(delivery)
-    if result['deliver'] not in {'log', 'github_comment'} and not result['deliver_extra'].get('chat_id'):
+    if (result['deliver'] not in {'log', 'github_comment', 'rose_callback'}
+            and not result['deliver_extra'].get('chat_id')):
         profile = result.get('profile')
         with adapter._profile_scope(profile):
             home = adapter._delivery_config(profile).get_home_channel(Platform(result['deliver']))

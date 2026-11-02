@@ -7,7 +7,8 @@ job per event; the rendered prompt is transient per-run context; exclusive with 
 (opt-in: a delivered response is also written into the target chat's transcript so follow-ups there have
 context). Per-route rate limiting,
 idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
-replay protection; body-only V1 is deprecated but accepted with a warning."""
+replay protection; body-only V1 is deprecated but accepted with a warning. deliver: rose_callback (Rose
+Command Centre) POSTs each run's settled reply to Rose once, signed with the route secret."""
 
 import asyncio
 import base64
@@ -152,6 +153,25 @@ def _timestamp_fresh(raw: str, stale_msg: str, *args) -> bool:
     return True
 
 
+# Provider failures an agent can return as its reply text (deliver: rose_callback). Only the first 1000
+# characters are checked, so a summary that mentions an error further down is not read as a failed run.
+_ROSE_FAILURE_MARKERS = (
+    "API call failed", "Final error:", "Max retries (3) exhausted", "Max retries exhausted", "⏳ Retrying in",
+    "Retrying in ", "❌", "☠", "Traceback (most recent call last):", "Error code: 4", "Error code: 5",
+    "⚠️ Error code:", "'type': 'error'")
+
+
+def _rose_callback_failure(content: str) -> Optional[str]:
+    """The error line of a reply that is really a provider failure (the "Final error:" line, else the
+    line holding the marker), else None."""
+    marker = next((m for m in _ROSE_FAILURE_MARKERS if m in (content or "")[:1000]), None)
+    if marker is None:
+        return None
+    lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    return next((line for line in lines if "Final error:" in line),
+                next((line for line in lines if marker in line), marker))[:500]
+
+
 def _is_known_platform(name: str) -> bool:
     """Cross-platform delivery target: built-in names or plugin-registered platforms."""
     if name in _BUILTIN_DELIVER_PLATFORMS:
@@ -273,6 +293,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 raise ValueError(f"[webhook] Route '{name}' sets both deliver_only and cron_job. They are mutually "
                                  f"exclusive: deliver_only pushes the rendered template as a message, cron_job fires "
                                  f"an existing cron job (which handles its own delivery).")
+        if route.get("deliver") == "rose_callback" and (secret == _INSECURE_NO_AUTH or route.get("deliver_only")
+                                                        or route.get("cron_job") or route.get("coalesce")):
+            raise ValueError(f"[webhook] Route '{name}' uses deliver: rose_callback, which signs one callback per "
+                             f"agent run with the route secret: it needs a real secret and no deliver_only, "
+                             f"cron_job or coalesce.")
         validate_coalesce_config(name, route)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -339,6 +364,11 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+        if deliver_type == "rose_callback":
+            # Interim and final messages alike: Rose gets one callback with the settled reply, sent by
+            # _finalize_delivery once the run is terminal (_send_rose_callback).
+            logger.debug("[webhook] rose_callback message for %s held for the settled callback", chat_id)
+            return SendResult(success=True)
         if self.gateway_runner and _is_known_platform(deliver_type):
             return await self._deliver_cross_platform(deliver_type, content, delivery)
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
@@ -746,7 +776,8 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.info("[webhook] %s event=%s route=%s prompt_len=%d delivery=%s", request.method, event_type, route_name,
                     len(prompt), delivery_id)
         outcome = await self._admit_agent_run(payload, prompt, delivery_id, now, route_config=route_config,
-                                              route_name=route_name, profile=profile, event_type=event_type)
+                                              route_name=route_name, profile=profile, event_type=event_type,
+                                              rose_request_id=request.headers.get("X-Rose-Request-Id", ""))
         if outcome is None:
             return _json_error("Admission unavailable; retry this delivery", 503)
         if outcome == "duplicate":
@@ -788,17 +819,21 @@ class WebhookAdapter(BasePlatformAdapter):
         return source
 
     async def _admit_agent_run(self, payload: Any, prompt: str, delivery_id: str, now: float, *, route_config: dict,
-                               route_name: str, profile, event_type: str) -> Optional[str]:
+                               route_name: str, profile, event_type: str, rose_request_id: str = "") -> Optional[str]:
         """Record delivery info and admit the run through the durable producer (shared by the immediate
         and coalesced paths). ``"accepted"`` / ``"duplicate"``, or None when admission failed."""
         # (profile, route, delivery_id) in the session key → concurrent webhooks get independent runs.
         identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
         session_chat_id = identity.session_chat_id
+        deliver_extra = self._render_delivery_extra(route_config.get("deliver_extra", {}), payload)
+        if route_config.get("deliver") == "rose_callback":
+            # Rose matches the callback to its job by this header; admission refuses a delivery without it.
+            deliver_extra["rose_request_id"] = rose_request_id
         # ``profile`` rides along so the reply leg (``send`` → ``_deliver_cross_platform``) egresses through
         # THIS profile's adapter, home channel and secrets — not the first profile that has the platform.
         self._delivery_info[session_chat_id] = {
             "deliver": route_config.get("deliver", "log"), "profile": profile,
-            "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
+            "deliver_extra": deliver_extra,
             "route": route_name,
             "mirror": route_config.get("mirror_to_session") is True}
         self._delivery_info_created[session_chat_id] = now
@@ -834,6 +869,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def _finalize_delivery(self, event, authority, receipt):
         from hermes_state_runtime import get_session_admission
+        started_at = time.time()
         try:
             row = get_session_admission(authority.db, admission_id=receipt.admission_id)
             if row['status'] in {'queued', 'started'}:
@@ -845,6 +881,7 @@ class WebhookAdapter(BasePlatformAdapter):
             await self._end_webhook_session(event, event.source.chat_id)
         except Exception:
             logger.exception("[webhook] Could not finalize admitted delivery %s", receipt.admission_id)
+        await self._send_rose_callback(event, authority, receipt.admission_id, started_at)
 
     async def _end_webhook_session(self, event: MessageEvent, session_chat_id: str) -> None:
         from gateway.platforms.webhook_ingress import finalize_webhook
@@ -852,6 +889,99 @@ class WebhookAdapter(BasePlatformAdapter):
         if binding is not None:
             authority, receipt = binding
             finalize_webhook(authority, receipt)
+
+    # --- Rose callback (deliver: rose_callback) ---
+
+    async def _send_rose_callback(self, event, authority, admission_id: str, started_at: float) -> None:
+        """Rose Command Centre: POST the run's settled reply to Rose once, after the admission is
+        terminal or waiting for it failed, so interim messages never reach Rose. A gateway restart
+        mid-run sends nothing for that run; Rose's stale-job sweep reports it as timed out."""
+        chat_id = event.source.chat_id
+        try:
+            route = self._routes.get(_WebhookDeliveryIdentity.route_from_chat_id(chat_id)) or {}
+        except (ValueError, TypeError, IndexError):
+            return
+        if route.get("deliver") != "rose_callback":
+            return
+        from gateway.platforms.webhook_delivery import retained_destination
+        try:
+            delivery = retained_destination(self, chat_id)
+        except Exception:
+            logger.exception("[webhook] rose_callback destination unavailable for %s", chat_id)
+            return
+        content, error = "", "Agent run did not settle"
+        try:
+            from gateway.session_results import admission_result
+            from hermes_state_runtime import get_session_admission
+            row = get_session_admission(authority.db, admission_id=admission_id)
+            if row is not None and row['status'] == 'terminal':
+                result = (admission_result(authority.db, admission_id) or {}).get('result') or {}
+                content = result.get('final_response') or ''
+                if row['outcome'] != 'completed' or result.get('failed'):
+                    error = f"Agent run ended: {row['outcome'] or 'unknown outcome'}"
+                else:
+                    error = None if content else "Agent produced no response"
+        except Exception:
+            logger.exception("[webhook] Could not read the settled result of admission %s", admission_id)
+        await self._post_rose_callback(content, delivery, route.get("secret", self._global_secret),
+                                       delivery_id=event.message_id, error=error, started_at=started_at)
+
+    async def _post_rose_callback(self, content: str, delivery: dict, secret: str, *, delivery_id: str,
+                                  error: Optional[str], started_at: Optional[float]) -> SendResult:
+        """POST one result to Rose's /api/hermes-callback, in Rose's ``HermesCallbackPayload`` shape
+        (server/hermesClient.ts): job_id, rose_request_id, status ("completed" | "failed"), summary,
+        artifacts, duration_ms, token_cost_usd, error. Header ``X-Hermes-Signature: t=<unix>,sha256=<hex
+        HMAC-SHA256 of "<unix>.<body>">``, keyed with the route secret; Rose rejects a stale timestamp.
+
+        Rose feeds a "completed" summary straight into its answer, so a failure must say "failed": the
+        ledger outcome decides first (*error*), then known provider-failure text (_rose_callback_failure).
+        Two attempts, re-signed each time; redirects are not followed."""
+        extra = delivery.get("deliver_extra") or {}
+        callback_url, rose_request_id = extra.get("callback_url", ""), extra.get("rose_request_id", "")
+        if not _is_usable_secret(secret) or secret == _INSECURE_NO_AUTH:
+            logger.error("[webhook] rose_callback for %s not sent: the route has no usable secret", rose_request_id)
+            return SendResult(success=False, error="Missing secret")
+        if error is None:
+            error = _rose_callback_failure(content)
+        body = {"job_id": delivery_id or rose_request_id, "rose_request_id": rose_request_id,
+                "status": "failed" if error else "completed",
+                # A failed run keeps a truncated summary: Rose logs it when it reports the failed job.
+                "summary": (content or "")[:2000] if error else content,
+                "artifacts": [],
+                "duration_ms": int((time.time() - started_at) * 1000) if started_at else None,
+                "token_cost_usd": None,
+                "error": error}
+        if error:
+            logger.warning("[webhook] rose_callback marking job %s FAILED: %s", rose_request_id, error[:200])
+        body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        result = SendResult(success=False, error="Not sent")
+        for attempt in range(2):
+            if attempt:
+                await asyncio.sleep(1)
+            timestamp = str(int(time.time()))
+            signature = _hex_hmac(secret, timestamp.encode() + b"." + body_bytes)
+            result = await self._post_rose_callback_once(callback_url, body_bytes, {
+                "Content-Type": "application/json", "X-Hermes-Signature": f"t={timestamp},sha256={signature}"})
+            if result.success:
+                logger.info("[webhook] rose_callback delivered for %s (status=%s)", rose_request_id, body["status"])
+                return result
+        logger.warning("[webhook] rose_callback for %s failed after 2 attempts: %s", rose_request_id, result.error)
+        return result
+
+    @staticmethod
+    async def _post_rose_callback_once(url: str, body: bytes, headers: dict) -> SendResult:
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.post(url, data=body, headers=headers, allow_redirects=False) as resp:
+                    if resp.status >= 300:
+                        logger.warning("[webhook] rose_callback target returned HTTP %d: %s", resp.status,
+                                       (await resp.text())[:200])
+                        return SendResult(success=False, error=f"HTTP {resp.status}")
+                    return SendResult(success=True)
+        except Exception as exc:
+            logger.warning("[webhook] rose_callback POST failed: %s", type(exc).__name__)
+            return SendResult(success=False, error=type(exc).__name__)
 
     # --- Signature validation ---
 
