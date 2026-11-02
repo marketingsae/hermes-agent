@@ -917,19 +917,25 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _send_rose_callback(self, event, authority, admission_id: str, started_at: float) -> None:
         """Rose Command Centre: POST the run's settled reply to Rose once, after the admission is
         terminal or waiting for it failed, so interim messages never reach Rose. A gateway restart
-        mid-run sends nothing for that run; Rose's stale-job sweep reports it as timed out."""
+        mid-run sends nothing for that run; Rose's stale-job sweep reports it as timed out. A completed
+        run with an empty reply is reported failed, so Rose never shows an empty answer as a result."""
         chat_id = event.source.chat_id
         try:
-            route = self._routes.get(_WebhookDeliveryIdentity.route_from_chat_id(chat_id)) or {}
+            route_name = _WebhookDeliveryIdentity.route_from_chat_id(chat_id)
         except (ValueError, TypeError, IndexError):
             return
-        if route.get("deliver") != "rose_callback":
+        if (self._routes.get(route_name) or {}).get("deliver") != "rose_callback":
             return
         from gateway.platforms.webhook_delivery import retained_destination
         try:
             delivery = retained_destination(self, chat_id)
         except Exception:
             logger.exception("[webhook] rose_callback destination unavailable for %s", chat_id)
+            return
+        # The route as it is now (retained_destination reloads the dynamic routes): its secret and hosts.
+        route = self._routes.get(route_name) or {}
+        if route.get("deliver") != "rose_callback":
+            logger.warning("[webhook] rose_callback for %s not sent: the route no longer delivers to Rose", chat_id)
             return
         content, error = "", "Agent run did not settle"
         try:
@@ -939,8 +945,10 @@ class WebhookAdapter(BasePlatformAdapter):
             if row is not None and row['status'] == 'terminal':
                 result = (admission_result(authority.db, admission_id) or {}).get('result') or {}
                 content = result.get('final_response') or ''
-                if row['outcome'] != 'completed' or result.get('failed'):
+                if row['outcome'] != 'completed':
                     error = f"Agent run ended: {row['outcome'] or 'unknown outcome'}"
+                elif result.get('failed'):
+                    error = "Agent run failed"
                 else:
                     error = None if content else "Agent produced no response"
         except Exception:

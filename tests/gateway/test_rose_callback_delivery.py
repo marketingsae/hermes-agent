@@ -300,6 +300,7 @@ async def test_callback_waits_for_the_run_to_settle(monkeypatch):
     ({"status": "terminal", "outcome": "cancelled"}, None, "Agent run ended: cancelled"),
     ({"status": "terminal", "outcome": "interrupted"}, None, "Agent run ended: interrupted"),
     (_DONE, {"result": {"final_response": "", "failed": False}}, "Agent produced no response"),
+    (_DONE, {"result": {"final_response": "partial notes", "failed": True}}, "Agent run failed"),
     ({"status": "unknown", "outcome": None}, None, "Agent run did not settle"),
 ])
 async def test_unsuccessful_runs_post_failed(monkeypatch, row, result, error):
@@ -400,11 +401,42 @@ async def test_no_callback_hosts_posts_nothing(monkeypatch, hosts):
 
 
 @pytest.mark.asyncio
-async def test_unusable_route_secret_posts_nothing(monkeypatch):
+@pytest.mark.parametrize("unusable", ["   ", "INSECURE_NO_AUTH"])
+async def test_unusable_route_secret_posts_nothing(monkeypatch, unusable):
     posted = _capture(monkeypatch)
-    result = await _adapter()._post_rose_callback("answer", _destination(), "   ", delivery_id="d", error=None,
+    result = await _adapter()._post_rose_callback("answer", _destination(), unusable, delivery_id="d", error=None,
                                                   started_at=None, callback_hosts=_HOSTS)
     assert not result.success and posted == []
+
+
+@pytest.mark.asyncio
+async def test_callback_is_signed_with_the_routes_own_secret(monkeypatch):
+    route_key = "dummy-credential-route-own"
+    _settle(monkeypatch, [_DONE], {"result": {"final_response": "answer", "failed": False}})
+    posted = _capture(monkeypatch)
+    route = _rose_route()
+    route["secret"] = route_key  # the route's own secret; the adapter-wide one stays _ROUTE_KEY
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={"secret": _ROUTE_KEY, "routes": {_ROUTE: route}}))
+    await _finalize(adapter, _event(adapter))
+    _url, _body, headers, raw = posted[0]
+    assert _rose_verifies(raw, headers["X-Hermes-Signature"], key=route_key)
+    assert not _rose_verifies(raw, headers["X-Hermes-Signature"], key=_ROUTE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_route_changed_after_admission_posts_nothing(monkeypatch):
+    _settle(monkeypatch, [_DONE], {"result": {"final_response": "answer", "failed": False}})
+    posted = _capture(monkeypatch)
+    adapter = _adapter()
+
+    def reload_then_read(adapter_, chat_id):
+        # A dynamic-route reload inside retained_destination replaced the route with a plain one.
+        adapter_._routes[_ROUTE] = {"prompt": "{text}"}
+        return _destination()
+
+    monkeypatch.setattr("gateway.platforms.webhook_delivery.retained_destination", reload_then_read)
+    await _finalize(adapter, _event(adapter))
+    assert posted == []
 
 
 # --- What counts as a failed run (provider failures returned as reply text) ---
@@ -503,7 +535,16 @@ async def test_signature_matches_roses_verifier_over_the_wire():
 
 
 @pytest.mark.asyncio
-async def test_a_failed_attempt_is_retried_once_and_re_signed():
+async def test_a_failed_attempt_is_retried_once_and_re_signed(monkeypatch):
+    # Each read of the clock is 2 s later, so a header reused from the first attempt would carry the old time.
+    import gateway.platforms.webhook as webhook_module
+    start, calls = time.time(), []
+
+    def ticking_time():
+        calls.append(1)
+        return start + 2 * len(calls)
+
+    monkeypatch.setattr(webhook_module.time, "time", ticking_time)
     server, seen = await _callback_server([500, 200])
     try:
         url = str(server.make_url("/api/hermes-callback"))
@@ -511,7 +552,30 @@ async def test_a_failed_attempt_is_retried_once_and_re_signed():
                                                       delivery_id="d-1", error=None, started_at=None,
                                                       callback_hosts=["127.0.0.1"])
         assert result.success and len(seen) == 2
+        first, second = (headers["X-Hermes-Signature"] for _p, _raw, headers in seen)
+        assert first != second
         assert all(_rose_verifies(raw, headers["X-Hermes-Signature"]) for _p, raw, headers in seen)
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_each_attempt_has_a_30_second_timeout(monkeypatch):
+    import aiohttp
+    totals, real_timeout = [], aiohttp.ClientTimeout
+
+    def recording_timeout(*args, **kwargs):
+        totals.append(kwargs.get("total"))
+        return real_timeout(*args, **kwargs)
+
+    monkeypatch.setattr(aiohttp, "ClientTimeout", recording_timeout)
+    server, _seen = await _callback_server([200])
+    try:
+        url = str(server.make_url("/api/hermes-callback"))
+        result = await _adapter()._post_rose_callback("answer", _destination(url=url), _ROUTE_KEY,
+                                                      delivery_id="d-1", error=None, started_at=None,
+                                                      callback_hosts=["127.0.0.1"])
+        assert result.success and totals == [30]
     finally:
         await server.close()
 
