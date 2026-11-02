@@ -19,19 +19,32 @@ def route_digest(adapter, chat_id):
     return hashlib.sha256(json.dumps(route, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def _rose_callback_url_ok(url):
-    """An https callback URL, or http to a loopback host (local tests); an unrendered template fails."""
+ROSE_CALLBACK_PATH = '/api/hermes-callback'
+
+
+def rose_callback_url(url, hosts=None):
+    """Rose's callback endpoint rebuilt from its checked parts, else None. https, or http to a loopback
+    host (local tests); no credentials, query or fragment; a port only on loopback; the path exactly
+    /api/hermes-callback. *hosts* is the route's ``callback_hosts`` list and must name the host; None
+    checks the shape only (a stored destination carries no route). An unrendered template fails."""
     from urllib.parse import urlsplit
     from gateway.platforms.webhook import _LOOPBACK_HOSTS
     if not isinstance(url, str):
-        return False
+        return None
     try:
         parts = urlsplit(url)
+        host, port = parts.hostname or '', parts.port
     except ValueError:
-        return False
-    if parts.scheme == 'https':
-        return bool(parts.hostname)
-    return parts.scheme == 'http' and parts.hostname in _LOOPBACK_HOSTS
+        return None
+    loopback = host in _LOOPBACK_HOSTS
+    allowed = hosts is None or (isinstance(hosts, (list, tuple)) and host in hosts)
+    if (not host or not allowed or parts.username is not None or parts.password is not None
+            or parts.query or parts.fragment or parts.path != ROSE_CALLBACK_PATH
+            or (port is not None and not loopback)
+            or not (parts.scheme == 'https' or (parts.scheme == 'http' and loopback))):
+        return None
+    netloc = f'[{host}]' if ':' in host else host
+    return f"{parts.scheme}://{netloc}{'' if port is None else f':{port}'}{ROSE_CALLBACK_PATH}"
 
 
 def validate_destination(delivery):
@@ -52,7 +65,9 @@ def validate_destination(delivery):
             raise RuntimeStoreError('invalid_params')
     elif target == 'rose_callback':
         # Rose Command Centre: the signing secret is the route's, read at send time, never stored here.
-        if not _rose_callback_url_ok(extra.get('callback_url')) or not isinstance(
+        # Admission stores the rebuilt URL, so a stored one that is not already in that form is refused.
+        url = extra.get('callback_url')
+        if not isinstance(url, str) or rose_callback_url(url) != url or not isinstance(
                 extra.get('rose_request_id'), str) or not extra['rose_request_id']:
             raise RuntimeStoreError('invalid_params')
     elif target != 'log' and not _is_known_platform(target):

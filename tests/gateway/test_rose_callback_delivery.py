@@ -2,7 +2,8 @@
 
 The destination is admitted with the delivery (callback URL and Rose request id only, never the route
 secret), interim and final ``send()`` calls post nothing, and ``_finalize_delivery`` posts once when the
-admission is terminal. Rose's verifier (server/hermesClient.ts ``verifyCallbackSignature``) checks
+admission is terminal. The callback URL must name a host on the route's ``callback_hosts``, at admission
+and again at send time. Rose's verifier (server/hermesClient.ts ``verifyCallbackSignature``) checks
 ``t=<unix>,sha256=<hex HMAC-SHA256 of "<unix>.<body>">`` within a 300 s window.
 """
 import asyncio
@@ -25,10 +26,12 @@ from tests.gateway.fixtures.webhook_route_authority import mount_authority
 _ROUTE_KEY = "dummy-credential-rose-route"
 _ROUTE = "rose-dispatch"
 _CALLBACK = "https://rose.example.test/api/hermes-callback"
+_HOSTS = ["rose.example.test"]
+_AT = "@"  # the userinfo separator, kept out of the literals so no case reads as an address
 
 
 def _rose_route(**overrides):
-    route = {"prompt": "{payload.prompt}", "deliver": "rose_callback",
+    route = {"prompt": "{payload.prompt}", "deliver": "rose_callback", "callback_hosts": list(_HOSTS),
              "deliver_extra": {"callback_url": "{payload.callback_url}"}}
     route.update(overrides)
     return route
@@ -65,6 +68,9 @@ def test_destination_keeps_only_callback_url_and_request_id():
 @pytest.mark.parametrize("url", [
     "http://rose.example.test/api/hermes-callback",  # plain http off loopback
     "{payload.callback_url}",                          # template left unrendered: the payload had no URL
+    "https://rose.example.test/api/other",             # not Rose's callback path
+    "https://rose.example.test/api/hermes-callback?next=x",
+    "https://ROSE.example.test/api/hermes-callback",   # not in the rebuilt form admission stores
     "ftp://rose.example.test/x", "https://", "", None, 7])
 def test_destination_refuses_a_bad_callback_url(url):
     from gateway.platforms.webhook_delivery import validate_destination
@@ -90,11 +96,53 @@ def test_destination_allows_http_to_loopback_and_needs_no_home_channel():
 
 @pytest.mark.parametrize("overrides", [
     {"coalesce": {"key": "{payload.id}", "window_seconds": 5}}, {"deliver_only": True}, {"cron_job": "nightly"},
-    {"secret": "INSECURE_NO_AUTH"}])
+    {"secret": "INSECURE_NO_AUTH"},
+    {"callback_hosts": None}, {"callback_hosts": []}, {"callback_hosts": "rose.example.test"},
+    {"callback_hosts": ["*.example.test"]}, {"callback_hosts": ["https://rose.example.test"]},
+    {"callback_hosts": ["Rose.example.test"]}, {"callback_hosts": ["rose.example.test:443"]},
+    {"callback_hosts": ["rose.example.test", 7]}])
 def test_route_validation_refuses_unsupported_rose_callback_routes(overrides):
     adapter = _adapter()
     with pytest.raises(ValueError):
         adapter._validate_route(_ROUTE, _rose_route(**overrides))
+
+
+def test_route_validation_accepts_named_hosts_and_loopback():
+    _adapter()._validate_route(_ROUTE, _rose_route(callback_hosts=["rose.example.test", "127.0.0.1", "::1"]))
+
+
+# --- The callback URL allow-list (the route's callback_hosts) ---
+
+
+@pytest.mark.parametrize("url,hosts", [
+    ("https://evil.example.test/api/hermes-callback", _HOSTS),
+    ("https://rose.example.test.evil.example/api/hermes-callback", _HOSTS),
+    ("https://rose.example.test./api/hermes-callback", _HOSTS),          # trailing dot
+    (f"https://rose.example.test{_AT}evil.example/api/hermes-callback", _HOSTS),
+    (f"https://evil.example\\{_AT}rose.example.test/api/hermes-callback", _HOSTS),
+    (f"https://user{_AT}rose.example.test/api/hermes-callback", _HOSTS),
+    ("https://rose.example.test:8443/api/hermes-callback", _HOSTS),       # a port off loopback
+    ("https://rose.example.test:notaport/api/hermes-callback", _HOSTS),
+    ("https://rose.example.test/api/hermes-callback/", _HOSTS),
+    ("https://rose.example.test/other/../api/hermes-callback", _HOSTS),
+    ("https://rose.example.test/api/hermes-callback#x", _HOSTS),
+    ("http://rose.example.test/api/hermes-callback", _HOSTS),
+    ("http://127.0.0.1:8999/api/hermes-callback", _HOSTS),               # loopback, but not listed
+    (_CALLBACK, ()), (_CALLBACK, "rose.example.test"),                    # nothing listed; a bare string
+])
+def test_callback_url_off_the_allow_list_is_refused(url, hosts):
+    from gateway.platforms.webhook_delivery import rose_callback_url
+    assert rose_callback_url(url, hosts) is None
+
+
+@pytest.mark.parametrize("url,hosts,rebuilt", [
+    ("https://ROSE.example.test/api/hermes-callback", _HOSTS, _CALLBACK),
+    ("http://127.0.0.1:8999/api/hermes-callback", ["127.0.0.1"], "http://127.0.0.1:8999/api/hermes-callback"),
+    ("http://[::1]:8999/api/hermes-callback", ["::1"], "http://[::1]:8999/api/hermes-callback"),
+])
+def test_allowed_callback_url_is_rebuilt_from_its_parts(url, hosts, rebuilt):
+    from gateway.platforms.webhook_delivery import rose_callback_url
+    assert rose_callback_url(url, hosts) == rebuilt
 
 
 # --- Admission: the signed Rose dispatch commits its destination ---
@@ -115,7 +163,9 @@ async def test_dispatch_commits_rose_destination_without_the_secret():
     mount_authority(app, adapter)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
     async with TestClient(TestServer(app)) as client:
-        response = await _post_dispatch(client, {"payload": {"prompt": "hello", "callback_url": _CALLBACK}})
+        # The upper-case host is stored in the rebuilt form, the one the callback is sent to.
+        response = await _post_dispatch(client, {"payload": {
+            "prompt": "hello", "callback_url": "https://ROSE.example.test/api/hermes-callback"}})
         assert response.status == 202, await response.text()
         runner = adapter._message_handler.__self__
         row = runner.session_authority.db._read_one("SELECT payload_json FROM session_admissions")
@@ -127,15 +177,17 @@ async def test_dispatch_commits_rose_destination_without_the_secret():
 @pytest.mark.parametrize("payload,request_id", [
     ({"payload": {"prompt": "hello", "callback_url": _CALLBACK}}, None),  # no X-Rose-Request-Id header
     ({"payload": {"prompt": "hello"}}, "rose-req-001"),                  # no callback URL to render
+    ({"payload": {"prompt": "hello", "callback_url": "https://evil.example.test/api/hermes-callback"}},
+     "rose-req-001"),                                                    # a host off callback_hosts
 ])
-async def test_dispatch_without_request_id_or_callback_url_is_refused(payload, request_id):
+async def test_dispatch_without_request_id_or_allowed_callback_url_is_refused(payload, request_id):
     adapter = _adapter()
     app = web.Application()
     mount_authority(app, adapter)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
     async with TestClient(TestServer(app)) as client:
         response = await _post_dispatch(client, payload, request_id=request_id)
-        assert response.status == 503
+        assert response.status == 400  # Rose does not retry a 4xx
         runner = adapter._message_handler.__self__
         assert runner.session_authority.db._read_one("SELECT COUNT(*) AS n FROM session_admissions")["n"] == 0
 
@@ -318,10 +370,40 @@ async def test_unreadable_destination_posts_nothing(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stored_url_off_the_routes_hosts_now_posts_nothing(monkeypatch):
+    # Admitted before the route's callback_hosts changed: the send-time check refuses it.
+    _settle(monkeypatch, [_DONE], {"result": {"final_response": "answer", "failed": False}},
+            destination=_destination(url="https://old.example.test/api/hermes-callback"))
+    posted = _capture(monkeypatch)
+    adapter = _adapter()
+    await _finalize(adapter, _event(adapter))
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_callback_goes_to_the_rebuilt_url_not_the_stored_string(monkeypatch):
+    _settle(monkeypatch, [_DONE], {"result": {"final_response": "answer", "failed": False}},
+            destination=_destination(url="https://ROSE.example.test/api/hermes-callback"))
+    posted = _capture(monkeypatch)
+    adapter = _adapter()
+    await _finalize(adapter, _event(adapter))
+    assert [p[0] for p in posted] == [_CALLBACK]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hosts", [None, []])
+async def test_no_callback_hosts_posts_nothing(monkeypatch, hosts):
+    posted = _capture(monkeypatch)
+    result = await _adapter()._post_rose_callback("answer", _destination(), _ROUTE_KEY, delivery_id="d",
+                                                  error=None, started_at=None, callback_hosts=hosts)
+    assert not result.success and posted == []
+
+
+@pytest.mark.asyncio
 async def test_unusable_route_secret_posts_nothing(monkeypatch):
     posted = _capture(monkeypatch)
     result = await _adapter()._post_rose_callback("answer", _destination(), "   ", delivery_id="d", error=None,
-                                                  started_at=None)
+                                                  started_at=None, callback_hosts=_HOSTS)
     assert not result.success and posted == []
 
 
@@ -350,15 +432,30 @@ def test_research_text_is_not_a_failure(content):
 
 
 @pytest.mark.asyncio
-async def test_completed_outcome_with_failure_text_posts_failed_with_a_truncated_summary(monkeypatch):
+async def test_completed_outcome_with_failure_text_posts_failed_with_a_truncated_summary(monkeypatch, caplog):
     content = "📝 Final error: Error code: 529 - overloaded\n" + "x" * 3000
     _settle(monkeypatch, [_DONE], {"result": {"final_response": content, "failed": False}})
     posted = _capture(monkeypatch)
     adapter = _adapter()
-    await _finalize(adapter, _event(adapter))
+    with caplog.at_level("DEBUG", logger="gateway.platforms.webhook"):
+        await _finalize(adapter, _event(adapter))
     body = posted[0][1]
     assert body["status"] == "failed" and body["error"] == "📝 Final error: Error code: 529 - overloaded"
     assert body["summary"] == content[:2000]
+    assert "marking job rose-req-001 FAILED" in caplog.text and "overloaded" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_failure_line_from_the_reply_is_not_logged(monkeypatch, caplog):
+    # A research reply whose first line trips a failure marker: Rose gets the line, the log does not.
+    content = "❌ planted-reply-text-7f3a no public website found\nMore findings follow."
+    _settle(monkeypatch, [_DONE], {"result": {"final_response": content, "failed": False}})
+    posted = _capture(monkeypatch)
+    adapter = _adapter()
+    with caplog.at_level("DEBUG"):
+        await _finalize(adapter, _event(adapter))
+    assert posted[0][1]["error"] == "❌ planted-reply-text-7f3a no public website found"
+    assert "planted-reply-text-7f3a" not in caplog.text
 
 
 # --- HTTP leg against a real local server ---
@@ -393,7 +490,8 @@ async def test_signature_matches_roses_verifier_over_the_wire():
     try:
         url = str(server.make_url("/api/hermes-callback"))
         result = await _adapter()._post_rose_callback("ünïcode answer", _destination(url=url), _ROUTE_KEY,
-                                                      delivery_id="d-1", error=None, started_at=time.time())
+                                                      delivery_id="d-1", error=None, started_at=time.time(),
+                                                      callback_hosts=["127.0.0.1"])
         assert result.success and len(seen) == 1
         _path, raw, headers = seen[0]
         assert headers["Content-Type"] == "application/json"
@@ -410,7 +508,8 @@ async def test_a_failed_attempt_is_retried_once_and_re_signed():
     try:
         url = str(server.make_url("/api/hermes-callback"))
         result = await _adapter()._post_rose_callback("answer", _destination(url=url), _ROUTE_KEY,
-                                                      delivery_id="d-1", error=None, started_at=None)
+                                                      delivery_id="d-1", error=None, started_at=None,
+                                                      callback_hosts=["127.0.0.1"])
         assert result.success and len(seen) == 2
         assert all(_rose_verifies(raw, headers["X-Hermes-Signature"]) for _p, raw, headers in seen)
     finally:
@@ -423,7 +522,8 @@ async def test_redirects_are_not_followed():
     try:
         url = str(server.make_url("/api/hermes-callback"))
         result = await _adapter()._post_rose_callback("answer", _destination(url=url), _ROUTE_KEY,
-                                                      delivery_id="d-1", error=None, started_at=None)
+                                                      delivery_id="d-1", error=None, started_at=None,
+                                                      callback_hosts=["127.0.0.1"])
         assert not result.success
         assert [path for path, _raw, _headers in seen] == ["/api/hermes-callback", "/api/hermes-callback"]
     finally:
